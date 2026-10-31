@@ -14,7 +14,62 @@ This README is the landing page and the **specification of the interface** (mast
 own README with everything that is specific to the family: the instances of the device, their settings and the status of
 the implementation.
 
-> **Status: design.** No implementation exists yet, the interface below is a proposal. Stories and branches follow.
+> **Status: STM32H5 implemented** (branch `Dev/STM32H5`, instances SAI1 and SAI2 of the STM32H562 / H563 / H573 and
+> STM32H5E4 / H5E5 / H5F4 / H5F5 lines; the other STM32H5 lines have no SAI, every function returns `SAI_REQUEST_ERROR`
+> there). The unit tests run on all 12 STM32H5 lines, the integration tests are compiled and linked but were not run on
+> hardware. Other families: design, the interface below is the specification.
+
+---
+
+## STM32H5 implementation
+
+| Item | STM32H5 |
+|---|---|
+| Instances | `SAI1`, `SAI2` (two sub-blocks A and B, 8-word FIFO); SPDIF output on both, PDM interface on `SAI1` only (`D[3:1]`, `CK[2:1]`, up to three microphone pairs) |
+| Kernel clock | PLL1 Q, PLL2 P or PLL3 P (`sai_ClkSrc_t`), one source for both sub-blocks of an instance, selected through the Rcc module |
+| Transfer | DMA (Gpdma, one channel per sub-block), circular or one shot buffer; no POLL / ISR transfer mode |
+| Protocols | I2S, MSB / LSB justified, PCM short / long, TDM, AC'97, SPDIF output (`SAI_PROTOCOL_*`), PDM |
+| Files | `Sai.c` (module), `Sai_Cfg.c` (frame, clock and register value calculations without register access), `Sai_Reg.c` (register access), `Sai_Pins.h` (generated pin lists) |
+
+How the interface behaves on STM32H5:
+
+- `Sai_Init` checks everything before it writes a register (lists, role and synchronization rules, protocol rules, pins of
+  the block, frame layout, kernel clock and the divider with the tolerance `MaxRateError_ppm`), then configures the
+  kernel clock and the interrupt of the instance, the registers (verified by the read-back) and the pins; a failed step
+  deinitializes the block. The block is left stopped.
+- The sample rate of a master block is the kernel clock divided by `MCKDIV` (1..63) and by 256 / 512 (master clock output,
+  the frame is `2^n` bits) or by the frame length (no master clock output); the closer of the two neighbouring dividers is
+  used, `Sai_Get_SampleRate` / `Sai_Get_SampleRateError` return the achieved rate and its error in ppm.
+- Synchronization: `SAI_SYNC_INTERNAL` takes the clocks of the other sub-block of the instance, `SAI_SYNC_EXTERNAL` the
+  clocks of the other instance (the providing block sets `SyncOutput`). The slave is enabled before the master; the master
+  is disabled before the slave (RM0481 "Disabling the SAI"), the module checks both orders.
+- PDM: `Sai_Set_PdmConfig` (SAI1 only) first, then `Sai_Init` of the block A with `SAI_PROTOCOL_PDM`; no other block is
+  needed. `Sai_Set_PdmConfig` enables the kernel clock of SAI1 when no sub-block is initialized (the source of the block A
+  replaces it in `Sai_Init`); the clock is released by `Sai_Deinit` of the last sub-block or by `Sai_Set_PdmInactive` when
+  no sub-block is initialized. The block is a master
+  receiver, `SampleRate` is the frame synchronization rate (the bitstream clock is `8 x SampleRate`), the frame is 16 bits per
+  microphone pair. The first two frames after the start are invalid and the decimation is a task of the application.
+- SPDIF: master transmitter, 32 bit items (`sai_Sample32_t`, bits 26..24 are the status bits, 23..0 the data), the buffer
+  holds whole SPDIF blocks (a multiple of 384 items); after an underrun the stream is restarted by `Sai_Set_XferStop` and
+  `Sai_Set_XferStart` (RM0481 recovery sequence).
+- The module does no cache maintenance.
+
+Deviations from the specification above (reasons):
+
+- Added functions: `Sai_Get_DefaultPdmConfig`, `Sai_Get_SampleRateError`, `Sai_Get_MclkOutput`, `Sai_Set_XferErrorClear`.
+  `Sai_InitPdmGpio` is split into `Sai_InitPdmClkGpio` and `Sai_InitPdmDataGpio` (two pin lists).
+- The buffer of a stream is `void *`, its items are `sai_Sample_t` (16 bit, data sizes up to 16 bits) or `sai_Sample32_t`
+  (32 bit); the callbacks `XferHalfCallback` / `XferCompleteCallback` take no parameter, `ErrorCallback` gets the
+  `SAI_XFER_ERROR_*` bit mask.
+- The README text "the master is stopped last" contradicts RM0481 59.4.15 (the master is disabled first); the hardware rule is
+  implemented.
+- Kernel clock sources are limited to the three PLL outputs: the Rcc module reports no frequency for the `PER` and the
+  `CKIN` source of the SAI clock multiplexer.
+- The sample rate and the master clock output change only on a stopped block (`MCKDIV` has to be configured with `SAIEN = 0`).
+- The underrun sends zero slots in hardware; `MuteValue` applies to the mute mode, `AutoMute` mutes the transmitter after an
+  underrun. A one shot buffer keeps the block running after the complete callback until `Sai_Set_XferStop`.
+- Errata: ES0565 (STM32H562 / H563 / H573) and ES0621 (STM32H523 / H533) contain no SAI item; there is no errata sheet of the
+  STM32H5E / H5F lines among the references, so for them the errata are not verified.
 
 ---
 
@@ -82,7 +137,7 @@ master.
 
 | Family | Branch | Instances | Status |
 |---|---|---|---|
-| STM32H5 | `Dev/STM32H5` | `SAI1`, `SAI2` (STM32H562 / H563 / H573 and STM32H5E / H5F lines; not on STM32H503 / H523 / H533), two sub-blocks, 8-word FIFO, I2S, MSB / LSB justified, PCM / DSP, TDM, AC'97, SPDIF output, PDM (up to 3 microphone pairs), GPDMA | planned (first) |
+| STM32H5 | `Dev/STM32H5` | `SAI1`, `SAI2` (STM32H562 / H563 / H573 and STM32H5E / H5F lines; not on STM32H503 / H523 / H533), two sub-blocks, 8-word FIFO, I2S, MSB / LSB justified, PCM / DSP, TDM, AC'97, SPDIF output, PDM (up to 3 microphone pairs), GPDMA | implemented, unit tests on 12 lines, integration tests not run on hardware |
 | STM32U5 | `Dev/STM32U5` | `SAI1`, `SAI2` | planned |
 | STM32H7 | `Dev/STM32H7` | `SAI1` ... `SAI4` (`SAI4` on the low-power domain with its own DMA) | planned |
 | STM32L4 | `Dev/STM32L4` | `SAI1`, `SAI2` | planned |
@@ -208,6 +263,7 @@ pdmConfig.MicPairs = 2u;                                 /* two pairs = four mic
   region or the cache maintenance of the application.
 - **Mute.** The transmitter can send the mute value (the output in a defined state) without stopping the clock; an
   automatic mute after the underrun is configurable, the receiver can report the detection of the mute frames.
+- **SCK pin of a master block.** A master block with a free protocol (I2S, MSB / LSB justified, PCM, TDM) serializes only when its `SCK` pin is configured as the alternate function: with no `SCK` pin the FIFO of a transmitter stays full and the stream never completes (found on the NUCLEO-H563ZI). `Sai_Init` therefore rejects (`SAI_REQUEST_ERROR`) a master block of a free protocol without its `SCK` pin. The SPDIF output and the PDM interface have no `SCK` pin and are not affected.
 - **Not part of the first version:** the audio processing, the codec drivers, the DMA scatter-gather for non-contiguous
   buffers, the SPDIF receiver (the hardware has the output only), the sample rate conversion, the dynamic reconfiguration
   of the slot map during the stream.
